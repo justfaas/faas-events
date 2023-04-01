@@ -1,0 +1,9 @@
+apiVersion: justfaas.com/v1alpha1
+kind: Function
+metadata:
+  name: events
+  namespace: faas
+  labels:
+    app.kubernetes.io/name: faas-events
+spec:
+  image: goncalooliveira/faas-events:0.1.0-alpha4
