@@ -1,25 +1,26 @@
 using System.Net.Http.Headers;
-using CloudNative.CloudEvents;
-using CloudNative.CloudEvents.SystemTextJson;
+using System.Text.Json;
 using NATS.Client.JetStream;
 
 internal sealed class NATSEventProcessorService : BackgroundService
 {
     private readonly ILogger logger;
-    private readonly CloudEventFormatter formatter = new JsonEventFormatter();
     private readonly NATSService nats;
     private readonly string gatewayUrl;
     private readonly HttpClient httpClient;
     private readonly TopicMap topicMap = new TopicMap();
+    private readonly EventMetrics metrics;
 
     public NATSEventProcessorService( ILoggerFactory loggerFactory
         , NATSService natsService
         , IHttpClientFactory httpClientFactory
+        , EventMetrics eventMetrics
         , Microsoft.Extensions.Options.IOptions<NATSEventProcessorOptions> optionsAccessor )
     {
         logger = loggerFactory.CreateLogger<NATSEventProcessorService>();
         httpClient = httpClientFactory.CreateClient();
         nats = natsService;
+        metrics = eventMetrics;
 
         var options = optionsAccessor.Value;
 
@@ -33,11 +34,9 @@ internal sealed class NATSEventProcessorService : BackgroundService
         {
             try
             {
-                //subscription = nats.Subscribe( Constants.FunctionInvokedCloudEventType );
-                subscription = nats.Subscribe( ">" );
+                subscription = nats.Subscribe( "com.justfaas.>" );
 
-                //logger.LogInformation( $"Subscribed to '{Constants.CloudEventType}' events." );
-                logger.LogInformation( $"Listening." );
+                logger.LogInformation( $"Subscribed to 'com.justfaas.>' event types." );
             }
             catch ( Exception ex )
             {
@@ -71,29 +70,32 @@ internal sealed class NATSEventProcessorService : BackgroundService
 
         try
         {
-            var cloudEvent = message.ToCloudEvent( formatter );
+            var faasEvent = JsonSerializer.Deserialize<Event>( message.Data );
 
-            if ( cloudEvent.Type == null )
+            if ( faasEvent == null )
             {
-                // event type is required
+                // TODO: log deserialization error
                 return Task.CompletedTask;
             }
 
-            if ( cloudEvent.Type.Equals( KnownCloudEventTypes.FunctionInvoked ) )
+            metrics.EventsReceivedTotal( faasEvent.EventType )
+                .Inc();
+
+            if ( faasEvent.EventType.Equals( KnownCloudEventTypes.FunctionInvoked ) )
             {
-                return InvokeFunction( cloudEvent, cancellationToken );
+                return InvokeFunction( faasEvent, cancellationToken );
             }
 
-            if ( IsFunctionManagementEvent( cloudEvent ) )
+            if ( IsFunctionManagementEvent( faasEvent ) )
             {
-                SynchronizeTopicMap( cloudEvent );
+                SynchronizeTopicMap( faasEvent );
 
                 return Task.CompletedTask;
             }
 
             // function topic subscription
-            var functionTasks = topicMap.Topics.GetValueOrDefault( cloudEvent.Type )?
-                .Select( f => InvokeFunctionWithEvent( f, cloudEvent, cancellationToken ) )
+            var functionTasks = topicMap.Topics.GetValueOrDefault( faasEvent.EventType )?
+                .Select( f => InvokeFunctionWithEvent( f, faasEvent, cancellationToken ) )
                 .ToArray();
 
             if ( functionTasks?.Any() == true )
@@ -112,172 +114,180 @@ internal sealed class NATSEventProcessorService : BackgroundService
         }
     }
 
-    private bool IsFunctionManagementEvent( CloudEvent cloudEvent )
-    {
-        if ( ( cloudEvent.Type == null ) || ( cloudEvent.Subject == null ) )
-        {
-            return ( false );
-        }
-
-        return new string[]
+    private bool IsFunctionManagementEvent( Event faasEvent )
+        => new string[]
         {
             KnownCloudEventTypes.FunctionAdded,
             KnownCloudEventTypes.FunctionModified,
             KnownCloudEventTypes.FunctionDeleted
         }
-        .Contains( cloudEvent.Type );
-    }
+        .Contains( faasEvent.EventType );
 
-    private void SynchronizeTopicMap( CloudEvent cloudEvent )
+    private void SynchronizeTopicMap( Event faasEvent )
     {
-        if ( !IsFunctionManagementEvent( cloudEvent ) )
+        if ( !IsFunctionManagementEvent( faasEvent ) )
         {
             return;
         }
 
+        var obj = JsonSerializer.Deserialize<KubernetesObject>( faasEvent.Content );
+
+        if ( obj == null )
+        {
+            // TODO: log deserialization error
+            return;
+        }
+
+        var functionName = obj.Metadata?.Name;
+        var functionNamespace = obj.Metadata?.Namespace ?? "default";
+
+        if ( functionName == null )
+        {
+            // TODO: log data error
+            return;
+        }
+
+        var functionPath = $"{functionNamespace}/{functionName}";
+
         if ( 
-            cloudEvent.Type!.Equals( KnownCloudEventTypes.FunctionAdded )
+            faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionAdded )
             ||
-            cloudEvent.Type!.Equals( KnownCloudEventTypes.FunctionModified )
+            faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionModified )
         )
         {
-            var obj = cloudEvent.ReadDataAsKubernetesObject();
-
-            var topics = obj?.Metadata?.Annotations?.Where( x => x.Key.Equals( "justfaas.com/topic" ) )
-                .SelectMany( x => x.Key.Split( ',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries ) )
+            var topics = obj.Metadata?.Annotations?.Where( x => x.Key.Equals( EventAnnotations.EventType ) )
+                .SelectMany( x => x.Value.Split( ',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries ) )
                 .ToArray();
 
             if ( topics?.Any() == true )
             {
                 // update topic map
-                topicMap.Subscribe( cloudEvent.Subject!, topics );
+                topicMap.Subscribe( functionPath, topics );
             }
             else
             {
                 // remove function tracking
-                topicMap.Unsubscribe( cloudEvent.Subject! );
+                topicMap.Unsubscribe( functionPath );
             }
         }
 
-        if ( cloudEvent.Type!.Equals( KnownCloudEventTypes.FunctionDeleted ) == true )
+        if ( faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionDeleted ) == true )
         {
             // remove function tracking
-            topicMap.Unsubscribe( cloudEvent.Subject! );
+            topicMap.Unsubscribe( functionPath );
         }
     }
 
-    private async Task InvokeFunctionWithEvent( string functionPath, CloudEvent cloudEvent, CancellationToken cancellationToken )
+    private async Task InvokeFunctionWithEvent( string functionPath, Event faasEvent, CancellationToken cancellationToken )
     {
-        var bytes = formatter.EncodeStructuredModeMessage( cloudEvent, out var contentType );
-
         var httpContent = new ByteArrayContent(
-            bytes.ToArray()
+            faasEvent.Content ?? Array.Empty<byte>()
         );
 
-
-        httpContent.Headers.ContentType = new MediaTypeHeaderValue( contentType.MediaType, contentType.CharSet );
+        if ( faasEvent.ContentType != null )
+        {
+            try
+            {
+                httpContent.Headers.ContentType = MediaTypeHeaderValue.Parse( faasEvent.ContentType );
+            }
+            catch
+            {
+                // TODO: log content type error
+            }
+        }
 
         var httpMessage = new HttpRequestMessage( HttpMethod.Post, $"{gatewayUrl}/proxy/{functionPath}" );
 
         HttpResponseMessage response;
 
-        logger.LogInformation( $"Start invoking functions/{cloudEvent.Subject}." );
+        logger.LogInformation( $"Start invoking function {functionPath}." );
 
         try
         {
             response = await httpClient.SendAsync( httpMessage, HttpCompletionOption.ResponseContentRead, cancellationToken );
 
-            logger.LogInformation( $"End invoking functions/{cloudEvent.Subject}. {(int)response.StatusCode}" );
+            logger.LogInformation( $"End invoking function {functionPath}. {(int)response.StatusCode}" );
         }
         catch ( Exception ex )
         {
-            logger.LogWarning( $"Failed invoking functions/{cloudEvent.Subject}. {ex.Message}" );
+            logger.LogWarning( $"Failed invoking function {functionPath}. {ex.Message}" );
 
             return;
         }
 
         // trigger webhook
-        var webhookValue = cloudEvent.GetWebhookUrlAttributeValue();
-
-        if ( webhookValue != null )
+        if ( faasEvent.WebhookUrl != null )
         {
-            await InvokeWebhookAsync( functionPath, webhookValue, response.Content, cancellationToken );
+            await InvokeWebhookAsync( functionPath, faasEvent.WebhookUrl, response.Content, cancellationToken );
         }
     }
 
-    private async Task InvokeFunction( CloudEvent cloudEvent, CancellationToken cancellationToken )
+    private async Task InvokeFunction( Event faasEvent, CancellationToken cancellationToken )
     {
-        if ( cloudEvent.Subject == null )
-        {
-            logger.LogError( "Unable to invoke function. Subject has a null value." );
-
-            return;
-        }
-
         FunctionCall? functionCall;
 
         try
         {
-            functionCall = cloudEvent.ToFunctionCall();
+            functionCall = JsonSerializer.Deserialize<FunctionCall>( faasEvent.Content );
         }
         catch ( Exception )
         {
-            // TODO: log
+            // TODO: log deserialization error
             return;
         }
 
         if ( functionCall == null )
         {
             // unable to deserialize... discard...
-            // TODO: log?
+            // TODO: log deserialization error
             return;
         }
 
-        var httpMessage = functionCall.ToHttpRequestMessage( cloudEvent.Subject, gatewayUrl );
+        var functionPath = string.Join( '/', functionCall.Namespace ?? "default", functionCall.Name );
+
+        var httpMessage = functionCall.ToHttpRequestMessage( functionPath, gatewayUrl );
         HttpResponseMessage response;
 
-        logger.LogInformation( $"Start invoking functions/{cloudEvent.Subject}." );
+        logger.LogInformation( $"Start invoking function {functionPath}." );
 
         try
         {
             response = await httpClient.SendAsync( httpMessage, HttpCompletionOption.ResponseContentRead, cancellationToken );
 
-            logger.LogInformation( $"End invoking functions/{cloudEvent.Subject}. {(int)response.StatusCode}" );
+            logger.LogInformation( $"End invoking function {functionPath}. {(int)response.StatusCode}" );
         }
         catch ( Exception ex )
         {
-            logger.LogWarning( $"Failed invoking functions/{cloudEvent.Subject}. {ex.Message}" );
+            logger.LogWarning( $"Failed invoking functions {functionPath}. {ex.Message}" );
 
             return;
         }
 
         // trigger webhook
-        var webhookValue = cloudEvent.GetWebhookUrlAttributeValue();
-
-        if ( webhookValue != null )
+        if ( faasEvent.WebhookUrl != null )
         {
-            await InvokeWebhookAsync( cloudEvent.Subject, webhookValue, response.Content, cancellationToken );
+            await InvokeWebhookAsync( functionPath, faasEvent.WebhookUrl, response.Content, cancellationToken );
         }
     }
 
-    private async Task InvokeWebhookAsync( string subject, string webhookUrl, HttpContent httpContent, CancellationToken cancellationToken )
+    private async Task InvokeWebhookAsync( string functionPath, string webhookUrl, HttpContent httpContent, CancellationToken cancellationToken )
     {
         if ( webhookUrl.StartsWith( "function://" ) )
         {
             webhookUrl = webhookUrl.Replace( "function://", $"{gatewayUrl}/proxy/" );
         }
 
-        logger.LogInformation( $"Start invoking webhooks/{subject}." );
+        logger.LogInformation( $"Start invoking webhook {functionPath} => {webhookUrl}." );
 
         try
         {
             var response = await httpClient.PostAsync( webhookUrl, httpContent, cancellationToken );
 
-            logger.LogInformation( $"End invoking webhooks/{subject}. {(int)response.StatusCode}" );
+            logger.LogInformation( $"End invoking webhook {functionPath} => {webhookUrl}. {(int)response.StatusCode}" );
         }
         catch ( Exception ex )
         {
-            logger.LogWarning( $"Failed invoking webhooks/{subject}. {ex.Message}" );
+            logger.LogWarning( $"Failed invoking webhook {functionPath} => {webhookUrl}. {ex.Message}" );
         }
     }
 }

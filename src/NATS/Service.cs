@@ -38,7 +38,7 @@ internal sealed class NATSService : IDisposable
         StreamInfo? streamInfo = null;
         try
         {
-            streamInfo = jetStream.GetStreamInfo( "faas-functions" );
+            streamInfo = jetStream.GetStreamInfo( "faas-events" );
         }
         catch {}
 
@@ -46,8 +46,8 @@ internal sealed class NATSService : IDisposable
         {
             jetStream.AddStream( 
                 StreamConfiguration.Builder()
-                    .AddSubjects( KnownCloudEventTypes.FunctionInvoked )
-                    .WithName( "faas-functions" )
+                    .AddSubjects( "com.justfaas.>" )
+                    .WithName( "faas-events" )
                     .WithMaxAge( NATS.Client.Internals.Duration.OfHours( 1 ) )
                     .WithRetentionPolicy( RetentionPolicy.WorkQueue )
                     .WithStorageType( StorageType.File )

@@ -1,14 +1,10 @@
 using System.Text;
-using CloudNative.CloudEvents;
-using CloudNative.CloudEvents.AspNetCore;
-using CloudNative.CloudEvents.SystemTextJson;
+using System.Text.Json;
 
 internal static class EventsApiEndpoints
 {
     private static ILogger logger = Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance
         .CreateLogger( "null" );
-
-    private static CloudEventFormatter formatter = new JsonEventFormatter();
 
     public static IEndpointRouteBuilder MapEventsApi( this IEndpointRouteBuilder builder )
     {
@@ -22,22 +18,30 @@ internal static class EventsApiEndpoints
 
     private static async Task<IResult> PublishAsync( HttpRequest httpRequest, NATSService nats )
     {
-        CloudEvent cloudEvent;
-        try
+        // TODO: should we support sending the event in the body as json?
+        // if so, we need a "deserializer". if the headers are in place, we use the haders
+        // but if the headers aren't in place and content type is json, we attempt to deserialize
+        // the content as an Event. Could be useful...??
+
+        var eventType = httpRequest.Headers.GetValueOrDefault( "X-Event-Type" );
+
+        if ( string.IsNullOrEmpty( eventType ) )
         {
-            cloudEvent = await httpRequest.ToCloudEventAsync( formatter );
-        }
-        catch ( ArgumentException )
-        {
+            // TODO: give error details
             return Results.BadRequest();
         }
 
-        // if ( cloudEvent.Type != Constants.FunctionInvokedCloudEventType )
-        // {
-        //     return Results.UnprocessableEntity();
-        // }
+        // create event and serialize as json
+        var faasEvent = new Event
+        {
+            EventType = eventType,
+            EventSource = httpRequest.Headers.GetValueOrDefault( "X-Event-Source" ),
+            Content = httpRequest.BodyReader.ReadAsByteArray(),
+            ContentType = httpRequest.ContentType,
+            WebhookUrl = httpRequest.Headers.GetValueOrDefault( "X-Event-Webhook-Url" )
+        };
 
-        var bytes = formatter.EncodeStructuredModeMessage( cloudEvent, out _ );
+        var bytes = JsonSerializer.SerializeToUtf8Bytes( faasEvent );
 
         // publish event
         try
@@ -45,7 +49,14 @@ internal static class EventsApiEndpoints
             var jetStream = nats.GetConnection()
                 .CreateJetStreamContext();
 
-            await jetStream.PublishAsync( cloudEvent.Type, bytes.ToArray() );
+            var publishType = faasEvent.EventType;
+
+            if ( !( publishType?.StartsWith( "com.justfaas.function." ) == true ) )
+            {
+                publishType = KnownCloudEventTypes.EventAdded;
+            }
+
+            await jetStream.PublishAsync( publishType, bytes );
         }
         catch ( Exception ex )
         {

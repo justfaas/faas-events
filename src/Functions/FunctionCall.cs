@@ -2,6 +2,9 @@ using System.Text.Json.Serialization;
 
 public sealed class FunctionCall
 {
+    public required string Name { get; set; }
+    public required string? Namespace { get; set; }
+
     [JsonConverter( typeof( DictionaryJsonConverter<string, string> ) )]
     public Dictionary<string, string> Arguments { get; set; } = new Dictionary<string, string>();
 

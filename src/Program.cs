@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Prometheus;
 
 /*
 Builder
@@ -46,12 +47,22 @@ builder.Services.AddHostedService<NATSEventProcessorService>()
         #endif
     } );
 
+builder.Services.AddSingleton<EventMetrics>();
+
 /*
 Kestrel
 */
 builder.WebHost.ConfigureKestrel( kestrel =>
 {
-    kestrel.ListenAnyIP( 8080 );
+    var port = 8080;
+    #if DEBUG
+    if ( int.TryParse( builder.Configuration["PORT"], out var portOverride ) )
+    {
+        port = portOverride;
+    }
+    #endif
+
+    kestrel.ListenAnyIP( port );
 } );
 
 /*
@@ -59,7 +70,10 @@ Runtime
 */
 var app = builder.Build();
 
+Metrics.SuppressDefaultMetrics();
+
 app.MapHealthChecks( "/healthz" );
+app.UseMetricServer();
 app.MapEventsApi();
 
 await app.RunAsync();
