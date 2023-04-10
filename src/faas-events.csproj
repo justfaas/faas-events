@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="KubernetesOperatorSdk" Version="0.1.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="7.0.1" />
     <PackageReference Include="NATS.Client" Version="1.0.3" />
     <PackageReference Include="prometheus-net" Version="8.0.0" />

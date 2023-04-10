@@ -1,5 +1,4 @@
-﻿using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
+﻿using k8s;
 using Prometheus;
 
 /*
@@ -22,6 +21,18 @@ builder.Logging.ClearProviders()
     .AddFilter( "System.Net.Http.HttpClient.Default.ClientHandler", LogLevel.Warning );
 
 builder.Services.AddHealthChecks();
+
+builder.Services.AddSingleton<IKubernetes>( provider =>
+{
+    var config = KubernetesClientConfiguration.IsInCluster()
+        ? KubernetesClientConfiguration.InClusterConfig()
+        : KubernetesClientConfiguration.BuildConfigFromConfigFile();
+
+    return new Kubernetes( config );
+} );
+
+builder.Services.AddSingleton<IFunctionEventLookup, FunctionEventLookup>();
+builder.Services.AddHostedService<V1Alpha1FunctionController>();
 builder.Services.AddHostedService<NATSEventProcessorService>()
     #if DEBUG
     .Configure<NATSEventProcessorOptions>( options =>

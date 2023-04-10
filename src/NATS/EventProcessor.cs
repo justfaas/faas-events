@@ -8,19 +8,21 @@ internal sealed class NATSEventProcessorService : BackgroundService
     private readonly NATSService nats;
     private readonly string gatewayUrl;
     private readonly HttpClient httpClient;
-    private readonly TopicMap topicMap = new TopicMap();
+    private readonly IFunctionEventLookup lookup;
     private readonly EventMetrics metrics;
 
     public NATSEventProcessorService( ILoggerFactory loggerFactory
         , NATSService natsService
         , IHttpClientFactory httpClientFactory
         , EventMetrics eventMetrics
+        , IFunctionEventLookup functionEventLookup
         , Microsoft.Extensions.Options.IOptions<NATSEventProcessorOptions> optionsAccessor )
     {
         logger = loggerFactory.CreateLogger<NATSEventProcessorService>();
         httpClient = httpClientFactory.CreateClient();
         nats = natsService;
         metrics = eventMetrics;
+        lookup = functionEventLookup;
 
         var options = optionsAccessor.Value;
 
@@ -83,18 +85,11 @@ internal sealed class NATSEventProcessorService : BackgroundService
 
             if ( faasEvent.EventType.Equals( KnownCloudEventTypes.FunctionInvoked ) )
             {
-                return InvokeFunction( faasEvent, cancellationToken );
-            }
-
-            if ( IsFunctionManagementEvent( faasEvent ) )
-            {
-                SynchronizeTopicMap( faasEvent );
-
-                return Task.CompletedTask;
+                return ExecuteFunctionCall( faasEvent, cancellationToken );
             }
 
             // function topic subscription
-            var functionTasks = topicMap.Topics.GetValueOrDefault( faasEvent.EventType )?
+            var functionTasks = lookup.GetFunctions( faasEvent.EventType )
                 .Select( f => InvokeFunctionWithEvent( f, faasEvent, cancellationToken ) )
                 .ToArray();
 
@@ -111,70 +106,6 @@ internal sealed class NATSEventProcessorService : BackgroundService
             logger.LogError( ex.Message );
 
             return Task.CompletedTask;
-        }
-    }
-
-    private bool IsFunctionManagementEvent( Event faasEvent )
-        => new string[]
-        {
-            KnownCloudEventTypes.FunctionAdded,
-            KnownCloudEventTypes.FunctionModified,
-            KnownCloudEventTypes.FunctionDeleted
-        }
-        .Contains( faasEvent.EventType );
-
-    private void SynchronizeTopicMap( Event faasEvent )
-    {
-        if ( !IsFunctionManagementEvent( faasEvent ) )
-        {
-            return;
-        }
-
-        var obj = JsonSerializer.Deserialize<KubernetesObject>( faasEvent.Content );
-
-        if ( obj == null )
-        {
-            // TODO: log deserialization error
-            return;
-        }
-
-        var functionName = obj.Metadata?.Name;
-        var functionNamespace = obj.Metadata?.Namespace ?? "default";
-
-        if ( functionName == null )
-        {
-            // TODO: log data error
-            return;
-        }
-
-        var functionPath = $"{functionNamespace}/{functionName}";
-
-        if ( 
-            faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionAdded )
-            ||
-            faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionModified )
-        )
-        {
-            var topics = obj.Metadata?.Annotations?.Where( x => x.Key.Equals( EventAnnotations.EventType ) )
-                .SelectMany( x => x.Value.Split( ',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries ) )
-                .ToArray();
-
-            if ( topics?.Any() == true )
-            {
-                // update topic map
-                topicMap.Subscribe( functionPath, topics );
-            }
-            else
-            {
-                // remove function tracking
-                topicMap.Unsubscribe( functionPath );
-            }
-        }
-
-        if ( faasEvent.EventType!.Equals( KnownCloudEventTypes.FunctionDeleted ) == true )
-        {
-            // remove function tracking
-            topicMap.Unsubscribe( functionPath );
         }
     }
 
@@ -222,7 +153,7 @@ internal sealed class NATSEventProcessorService : BackgroundService
         }
     }
 
-    private async Task InvokeFunction( Event faasEvent, CancellationToken cancellationToken )
+    private async Task ExecuteFunctionCall( Event faasEvent, CancellationToken cancellationToken )
     {
         FunctionCall? functionCall;
 
