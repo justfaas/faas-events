@@ -34,18 +34,17 @@ builder.Services.AddSingleton<IKubernetes>( provider =>
 builder.Services.AddSingleton<IFunctionEventLookup, FunctionEventLookup>();
 builder.Services.AddHostedService<V1Alpha1FunctionController>();
 builder.Services.AddHostedService<NATSEventProcessorService>()
-    #if DEBUG
-    .Configure<NATSEventProcessorOptions>( options =>
+    .AddFunctionExecutor( options =>
     {
+        #if DEBUG
         var gatewayUrl = builder.Configuration["GATEWAY_URL"];
 
         if ( gatewayUrl != null )
         {
             options.GatewayUrl = gatewayUrl;
         }
+        #endif
     } )
-    #endif
-    .AddHttpClient()
     .AddNATS( options =>
     {
         #if DEBUG

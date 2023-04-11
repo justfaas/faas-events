@@ -6,27 +6,33 @@ internal sealed class NATSEventProcessorService : BackgroundService
 {
     private readonly ILogger logger;
     private readonly NATSService nats;
-    private readonly string gatewayUrl;
-    private readonly HttpClient httpClient;
-    private readonly IFunctionEventLookup lookup;
     private readonly EventMetrics metrics;
+    private readonly IFunctionExecutor executor;
 
     public NATSEventProcessorService( ILoggerFactory loggerFactory
         , NATSService natsService
-        , IHttpClientFactory httpClientFactory
+        , IFunctionExecutor functionExecutor
         , EventMetrics eventMetrics
-        , IFunctionEventLookup functionEventLookup
-        , Microsoft.Extensions.Options.IOptions<NATSEventProcessorOptions> optionsAccessor )
+    )
     {
         logger = loggerFactory.CreateLogger<NATSEventProcessorService>();
-        httpClient = httpClientFactory.CreateClient();
         nats = natsService;
         metrics = eventMetrics;
-        lookup = functionEventLookup;
+        executor = functionExecutor;
+    }
 
-        var options = optionsAccessor.Value;
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        logger.LogInformation( "Started." );
 
-        gatewayUrl = options.GatewayUrl.TrimEnd( '/' );
+        return base.StartAsync( cancellationToken );
+    }
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        logger.LogInformation( "Stopped." );
+
+        return base.StopAsync( cancellationToken );
     }
 
     protected override async Task ExecuteAsync( CancellationToken stoppingToken )
@@ -66,7 +72,7 @@ internal sealed class NATSEventProcessorService : BackgroundService
         subscription?.Unsubscribe();
     }
 
-    private Task ExecuteAsync( NATS.Client.Msg message, CancellationToken cancellationToken )
+    private async Task ExecuteAsync( NATS.Client.Msg message, CancellationToken cancellationToken )
     {
         message.Ack();
 
@@ -76,149 +82,19 @@ internal sealed class NATSEventProcessorService : BackgroundService
 
             if ( faasEvent == null )
             {
-                // TODO: log deserialization error
-                return Task.CompletedTask;
+                logger.LogWarning( "Failed to deserialize event." );
+
+                return;
             }
 
             metrics.EventsReceivedTotal( faasEvent.EventType )
                 .Inc();
 
-            if ( faasEvent.EventType.Equals( KnownCloudEventTypes.FunctionInvoked ) )
-            {
-                return ExecuteFunctionCall( faasEvent, cancellationToken );
-            }
-
-            // function topic subscription
-            var functionTasks = lookup.GetFunctions( faasEvent.EventType )
-                .Select( f => InvokeFunctionWithEvent( f, faasEvent, cancellationToken ) )
-                .ToArray();
-
-            if ( functionTasks?.Any() == true )
-            {
-                return Task.WhenAll( functionTasks );
-            }
-
-            // discard unknown types
-            return Task.CompletedTask;
+            await executor.ExecuteAsync( faasEvent, cancellationToken );
         }
         catch ( Exception ex )
         {
-            logger.LogError( ex.Message );
-
-            return Task.CompletedTask;
-        }
-    }
-
-    private async Task InvokeFunctionWithEvent( string functionPath, Event faasEvent, CancellationToken cancellationToken )
-    {
-        var httpContent = new ByteArrayContent(
-            faasEvent.Content ?? Array.Empty<byte>()
-        );
-
-        if ( faasEvent.ContentType != null )
-        {
-            try
-            {
-                httpContent.Headers.ContentType = MediaTypeHeaderValue.Parse( faasEvent.ContentType );
-            }
-            catch
-            {
-                // TODO: log content type error
-            }
-        }
-
-        var httpMessage = new HttpRequestMessage( HttpMethod.Post, $"{gatewayUrl}/proxy/{functionPath}" );
-
-        HttpResponseMessage response;
-
-        logger.LogInformation( $"Start invoking function {functionPath}." );
-
-        try
-        {
-            response = await httpClient.SendAsync( httpMessage, HttpCompletionOption.ResponseContentRead, cancellationToken );
-
-            logger.LogInformation( $"End invoking function {functionPath}. {(int)response.StatusCode}" );
-        }
-        catch ( Exception ex )
-        {
-            logger.LogWarning( $"Failed invoking function {functionPath}. {ex.Message}" );
-
-            return;
-        }
-
-        // trigger webhook
-        if ( faasEvent.WebhookUrl != null )
-        {
-            await InvokeWebhookAsync( functionPath, faasEvent.WebhookUrl, response.Content, cancellationToken );
-        }
-    }
-
-    private async Task ExecuteFunctionCall( Event faasEvent, CancellationToken cancellationToken )
-    {
-        FunctionCall? functionCall;
-
-        try
-        {
-            functionCall = JsonSerializer.Deserialize<FunctionCall>( faasEvent.Content );
-        }
-        catch ( Exception )
-        {
-            // TODO: log deserialization error
-            return;
-        }
-
-        if ( functionCall == null )
-        {
-            // unable to deserialize... discard...
-            // TODO: log deserialization error
-            return;
-        }
-
-        var functionPath = string.Join( '/', functionCall.Namespace ?? "default", functionCall.Name );
-
-        var httpMessage = functionCall.ToHttpRequestMessage( functionPath, gatewayUrl );
-        HttpResponseMessage response;
-
-        logger.LogInformation( $"Start invoking function {functionPath}." );
-
-        try
-        {
-            response = await httpClient.SendAsync( httpMessage, HttpCompletionOption.ResponseContentRead, cancellationToken );
-
-            logger.LogInformation( $"End invoking function {functionPath}. {(int)response.StatusCode}" );
-        }
-        catch ( Exception ex )
-        {
-            logger.LogWarning( $"Failed invoking functions {functionPath}. {ex.Message}" );
-
-            return;
-        }
-
-        // trigger webhook
-        if ( faasEvent.WebhookUrl != null )
-        {
-            await InvokeWebhookAsync( functionPath, faasEvent.WebhookUrl, response.Content, cancellationToken );
-        }
-    }
-
-    private async Task InvokeWebhookAsync( string functionPath, string webhookUrl, HttpContent httpContent, CancellationToken cancellationToken )
-    {
-        if ( webhookUrl.StartsWith( "function://" ) )
-        {
-            webhookUrl = webhookUrl.Replace( "function://", $"{gatewayUrl}/proxy/" );
-        }
-
-        logger.LogInformation( $"Start invoking webhook {functionPath} => {webhookUrl}." );
-
-        try
-        {
-            var response = await httpClient.PostAsync( webhookUrl, httpContent, cancellationToken );
-
-            logger.LogInformation( $"End invoking webhook {functionPath} => {webhookUrl}. {(int)response.StatusCode}" );
-        }
-        catch ( Exception ex )
-        {
-            logger.LogWarning( $"Failed invoking webhook {functionPath} => {webhookUrl}. {ex.Message}" );
+            logger.LogError( ex, ex.Message );
         }
     }
 }

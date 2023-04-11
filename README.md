@@ -6,9 +6,10 @@ This component reads events from a stream source. Some of these events are known
 
 All known event types have the `com.justfaas.` prefix. They are intended for the component.
 
-| Event type             | Description                                                                |
-|----------------------- | -------------------------------------------------------------------------- |
-| event.added            | Sent when an event is added. Triggers function(s) matching the event type. |
+| Event type       | Description                                                                |
+|----------------- | -------------------------------------------------------------------------- |
+| event.added      | Sent when an event is added. Triggers function(s) matching the event type. |
+| function.invoked | Sent by the gateway from an async request. Triggers immediate execution.   |
 
 ## API
 

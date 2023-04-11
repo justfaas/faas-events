@@ -19,19 +19,24 @@ internal static class EventsApiEndpoints
     private static async Task<IResult> PublishAsync( HttpRequest httpRequest, NATSService nats )
     {
         // TODO: should we support sending the event in the body as json?
-        // if so, we need a "deserializer". if the headers are in place, we use the haders
-        // but if the headers aren't in place and content type is json, we attempt to deserialize
-        // the content as an Event. Could be useful...??
+        // if so, we need a "deserializer". if the headers are in place, we use them
+        // but if the headers aren't in place and content type is json (or json+event ?)
+        // we attempt to deserialize the content as an Event. Could be useful...??
 
         var eventType = httpRequest.Headers.GetValueOrDefault( "X-Event-Type" );
 
         if ( string.IsNullOrEmpty( eventType ) )
         {
-            // TODO: give error details
-            return Results.BadRequest();
+            return Results.BadRequest( new HttpValidationProblemDetails
+            {
+                Errors =
+                {
+                    { "X-Event-Type", new string[] { "Event type header is required." } }
+                }
+            });
         }
 
-        // create event and serialize as json
+        // create event and serialize it as json
         var faasEvent = new Event
         {
             EventType = eventType,
@@ -62,8 +67,10 @@ internal static class EventsApiEndpoints
         {
             logger.LogError( ex, ex.Message );
 
-            // TODO: return details on response body
-            return Results.StatusCode( 500 );
+            return Results.Json( statusCode: 500, data: new
+            {
+                message = ex.Message
+            } );
         }
 
         return Results.Accepted();
