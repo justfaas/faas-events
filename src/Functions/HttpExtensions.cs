@@ -43,7 +43,7 @@ internal static class FunctionCallHttpExtensions
             path = string.Concat( path, "?", args );
         }
 
-        var uri = $"{gatewayUrl}/proxy/{functionName}{path}";
+        var uri = $"{gatewayUrl.TrimEnd( '/' )}/proxy/{functionName}{path}";
 
         return new HttpRequestMessage( new HttpMethod( method ), uri );
     }
