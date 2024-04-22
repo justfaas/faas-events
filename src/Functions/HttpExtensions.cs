@@ -10,10 +10,10 @@ internal static class FunctionCallHttpExtensions
 
         var authorization = functionCall.Metadata.GetValueOrDefault( "Authorization", string.Empty );
 
-        if ( !string.IsNullOrEmpty( authorization ) )
-        {
-            httpContent.Headers.Add( "Authorization", authorization );
-        }
+        // if ( !string.IsNullOrEmpty( authorization ) )
+        // {
+        //     httpContent.Headers.Add( "Authorization", authorization );
+        // }
 
         foreach ( var header in functionCall.Metadata.Where( x => x.Key.StartsWith( "HTTP_HEADER_" )) )
         {
@@ -45,6 +45,13 @@ internal static class FunctionCallHttpExtensions
 
         var uri = $"{gatewayUrl.TrimEnd( '/' )}/proxy/{functionName}{path}";
 
-        return new HttpRequestMessage( new HttpMethod( method ), uri );
+        var httpRequest = new HttpRequestMessage( new HttpMethod( method ), uri );
+
+        if ( !string.IsNullOrEmpty( authorization ) )
+        {
+            httpRequest.Headers.Add( "Authorization", authorization );
+        }
+
+        return httpRequest;
     }
 }
