@@ -1,26 +1,39 @@
-### Builder
-FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/nightly/sdk:8.0-preview AS build
+# syntax=docker/dockerfile:1.3
+
+# Create a stage for building the application.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:8.0-alpine AS build
+ENV DOTNET_CLI_TELEMETRY_OPTOUT 1
+
+COPY src /source
+
+WORKDIR /source
+
+# This is the architecture you’re building for, which is passed in by the builder.
+# Placing it here allows the previous steps to be cached across architectures.
 ARG TARGETARCH
+
+RUN apk update && apk add --no-cache libxml2-utils
+
+# Build the application.
+# Leverage a cache mount to /root/.nuget/packages so that subsequent builds don't have to re-download packages.
+# If TARGETARCH is "amd64", replace it with "x64" - "x64" is .NET's canonical name for this and "amd64" doesn't
+#   work in .NET 6.0.
+RUN --mount=type=cache,id=nuget,target=/root/.nuget/packages \
+    dotnet publish -a ${TARGETARCH/amd64/x64} --use-current-runtime --self-contained false -o /app
+
+# Create a new stage for running the application that contains the minimal
+# runtime dependencies for the application. This often uses a different base
+# image from the build stage where the necessary files are copied from the build
+# stage.
+FROM mcr.microsoft.com/dotnet/aspnet:8.0-alpine AS final
 WORKDIR /app
 
-RUN apt update && apt install libxml2-utils -y
+# Copy everything needed to run the app from the "build" stage.
+COPY --from=build /app .
 
-# restore dependencies; use nuget config for private dependencies
-COPY ./src/faas-events.csproj ./
-RUN dotnet restore -a $TARGETARCH
+# Switch to a non-privileged user (defined in the base image) that the app will run under.
+# See https://docs.docker.com/go/dockerfile-user-best-practices/
+# and https://github.com/dotnet/dotnet-docker/discussions/4764
+USER $APP_UID
 
-COPY ./src/. ./
-RUN dotnet publish -c release -a $TARGETARCH -o dist faas-events.csproj
-
-### Runtime
-FROM mcr.microsoft.com/dotnet/aspnet:7.0 as final
-
-RUN addgroup faas-app && useradd -G faas-app faas-user
-
-WORKDIR /app
-COPY --from=build /app/dist/ ./
-RUN chown faas-user:faas-app -R .
-
-USER faas-user
-
-ENTRYPOINT [ "dotnet", "faas-events.dll" ]
+ENTRYPOINT ["dotnet", "faas-events.dll"]
